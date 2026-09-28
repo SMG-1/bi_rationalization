@@ -1,0 +1,412 @@
+-- =============================================================================
+-- CONFORMED — one model of the estate, whatever tool it came from
+-- -----------------------------------------------------------------------------
+-- A Tableau workbook, a Power BI report and a Webi document are the same kind
+-- of thing: a titled container, owned by somebody, living in a folder, made of
+-- components, computing fields, over source tables, read by people. Every
+-- downstream step (scoring, rules, target model, conversion) reads THIS model
+-- and never a tool table — which is what makes a fourth tool a conform job and
+-- not a rewrite.
+-- =============================================================================
+USE DATABASE BI_MODERNIZATION;
+USE SCHEMA CONFORMED;
+
+-- The directory, one row per email. Real directories carry shared mailboxes
+-- and service accounts under one address; a naive join would double every
+-- asset those accounts own, so the active, most senior record wins.
+CREATE OR REPLACE VIEW CONFORMED.V_USER AS
+SELECT * FROM INVENTORY.USER_DIRECTORY
+QUALIFY ROW_NUMBER() OVER (PARTITION BY LOWER(EMAIL) ORDER BY IS_ACTIVE DESC, IS_EXECUTIVE DESC, IS_BI_DEVELOPER DESC, USER_ID) = 1;
+
+-- ---------------------------------------------------------------- ASSET -----
+CREATE OR REPLACE TABLE ASSET AS
+WITH tab AS (
+    SELECT w.WORKBOOK_ID                                   AS ASSET_ID,
+           'TABLEAU'                                       AS PLATFORM,
+           'WORKBOOK'                                      AS ASSET_KIND,
+           w.NAME                                          AS TITLE,
+           w.PROJECT_PATH                                  AS CONTAINER_PATH,
+           w.PROJECT_PATH ILIKE 'Personal/%'               AS IS_PERSONAL_SPACE,
+           w.PROJECT_PATH ILIKE 'Sandbox/%'                AS IS_SANDBOX,
+           w.OWNER_EMAIL                                   AS OWNER_EMAIL,
+           w.CREATED_AT, w.UPDATED_AT                      AS MODIFIED_AT,
+           w.HAS_CERTIFIED_DS                              AS IS_CERTIFIED,
+           (SELECT COUNT(*) FROM INVENTORY.TABLEAU_VIEWS v WHERE v.WORKBOOK_ID = w.WORKBOOK_ID) AS COMPONENT_COUNT,
+           w.SIZE_MB,
+           w.CONTENT_URL                                   AS NATIVE_REF
+    FROM INVENTORY.TABLEAU_WORKBOOKS w
+), pbi AS (
+    SELECT r.REPORT_ID, 'POWER_BI',
+           CASE WHEN r.REPORT_TYPE = 'PaginatedReport' THEN 'PAGINATED_REPORT' ELSE 'REPORT' END,
+           r.NAME,
+           ws.NAME,
+           ws.TYPE = 'PersonalGroup',
+           ws.NAME ILIKE '% - Dev',
+           r.CREATED_BY,
+           r.CREATED_DATETIME, r.MODIFIED_DATETIME,
+           d.ENDORSEMENT = 'Certified',
+           (SELECT COUNT(*) FROM INVENTORY.PBI_REPORT_PAGES p WHERE p.REPORT_ID = r.REPORT_ID),
+           NULL,
+           r.WEB_URL
+    FROM INVENTORY.PBI_REPORTS r
+    JOIN INVENTORY.PBI_WORKSPACES ws ON ws.WORKSPACE_ID = r.WORKSPACE_ID
+    LEFT JOIN INVENTORY.PBI_DATASETS d ON d.DATASET_ID = r.DATASET_ID
+), bo AS (
+    SELECT d.DOC_KEY, 'SAP_BO',
+           CASE WHEN d.SI_KIND = 'CrystalReport' THEN 'CRYSTAL_REPORT' ELSE 'WEBI_DOCUMENT' END,
+           d.SI_NAME,
+           d.FOLDER_PATH,
+           d.FOLDER_PATH ILIKE 'Favorites/%',
+           d.FOLDER_PATH ILIKE '%/Archive',
+           d.SI_OWNER,
+           d.SI_CREATION_TIME, d.SI_UPDATE_TS,
+           FALSE,
+           (SELECT COUNT(*) FROM INVENTORY.BO_REPORT_ELEMENTS e WHERE e.DOC_SI_ID = d.SI_ID),
+           d.SIZE_MB,
+           'SI_ID=' || d.SI_ID
+    FROM INVENTORY.BO_WEBI_DOCUMENTS d
+), mede AS (
+    -- MedeAnalytics: a hosted platform. Vendor "Standard" content is owned by the
+    -- vendor; custom reports by a user. Standard reports are treated as certified.
+    SELECT r.REPORT_ID, 'MEDEANALYTICS',
+           IFF(r.FORMAT = 'Dashboard', 'DASHBOARD', 'REPORT'),
+           r.REPORT_NAME,
+           r.FOLDER_PATH,
+           r.FOLDER_PATH ILIKE 'My Reports/%',
+           FALSE,
+           IFF(r.OWNER = 'MedeAnalytics', NULL, r.OWNER),
+           r.CREATED_DATE, r.MODIFIED_DATE,
+           r.REPORT_TYPE = 'Standard',
+           (SELECT COUNT(*) FROM INVENTORY.MEDE_REPORT_SECTIONS x WHERE x.REPORT_ID = r.REPORT_ID),
+           NULL,
+           'module=' || r.MODULE || '; type=' || r.REPORT_TYPE
+    FROM INVENTORY.MEDE_REPORTS r
+), u AS (
+    SELECT * FROM tab UNION ALL SELECT * FROM pbi UNION ALL SELECT * FROM bo UNION ALL SELECT * FROM mede
+)
+SELECT u.ASSET_ID, u.PLATFORM, u.ASSET_KIND, u.TITLE, u.CONTAINER_PATH,
+       u.IS_PERSONAL_SPACE, u.IS_SANDBOX, u.OWNER_EMAIL,
+       ud.DEPARTMENT                                          AS OWNER_DEPARTMENT,
+       COALESCE(ud.IS_ACTIVE, FALSE)                          AS OWNER_IS_ACTIVE,
+       COALESCE(ud.IS_BI_DEVELOPER, FALSE)                    AS OWNER_IS_DEVELOPER,
+       u.CREATED_AT, u.MODIFIED_AT, u.IS_CERTIFIED, u.COMPONENT_COUNT, u.SIZE_MB, u.NATIVE_REF,
+       -- a title with the noise stripped, for duplicate detection
+       TRIM(REGEXP_REPLACE(REGEXP_REPLACE(LOWER(u.TITLE),
+            '(copy of |\\(copy\\)| - copy|\\bv[0-9]+\\b|\\(final\\)|\\bfinal\\b|\\bdraft\\b|\\btest\\b|\\bnew\\b|\\bold\\b|\\(old\\)|\\(2\\)|backup|do not (use|delete)|\\b(fy)?20[0-9]{2}\\b|\\bfy[0-9]{2}\\b|\\b[0-9]+\\b|''s version| - [a-z]+ view| - [a-z]+''s| - (weekly|monthly|daily|regional|detail|exec summary|ops huddle)|by [a-z ]+$)', ''),
+            '[^a-z0-9 ]', ' '))                                AS TITLE_KEY
+FROM u
+LEFT JOIN CONFORMED.V_USER ud ON LOWER(ud.EMAIL) = LOWER(u.OWNER_EMAIL);
+
+ALTER TABLE ASSET ADD PRIMARY KEY (ASSET_ID);
+
+-- ------------------------------------------------------ ASSET_COMPONENT -----
+CREATE OR REPLACE TABLE ASSET_COMPONENT AS
+SELECT v.VIEW_ID AS COMPONENT_ID, v.WORKBOOK_ID AS ASSET_ID, v.NAME,
+       UPPER(v.SHEET_TYPE) AS COMPONENT_KIND,
+       PARSE_JSON(v.LAYOUT_JSON):viz::TEXT AS VIZ_TYPE,
+       PARSE_JSON(v.LAYOUT_JSON):rows::ARRAY AS DIMENSIONS,
+       PARSE_JSON(v.LAYOUT_JSON):cols::ARRAY AS MEASURES,
+       PARSE_JSON(v.LAYOUT_JSON):filters::ARRAY AS FILTERS,
+       PARSE_JSON(v.LAYOUT_JSON):has_parameter::BOOLEAN AS HAS_PARAMETER
+FROM INVENTORY.TABLEAU_VIEWS v
+UNION ALL
+SELECT p.REPORT_ID || ':' || p.PAGE_NAME, p.REPORT_ID, p.DISPLAY_NAME, 'PAGE',
+       PARSE_JSON(p.VISUAL_TYPES)[0]::TEXT,
+       ARRAY_SLICE(PARSE_JSON(p.LAYOUT_JSON):fields::ARRAY, 0, 3),
+       ARRAY_SLICE(PARSE_JSON(p.LAYOUT_JSON):fields::ARRAY, 3, 99),
+       PARSE_JSON(p.LAYOUT_JSON):filters::ARRAY,
+       PARSE_JSON(p.LAYOUT_JSON):has_parameter::BOOLEAN
+FROM INVENTORY.PBI_REPORT_PAGES p
+UNION ALL
+SELECT d.DOC_KEY || ':' || e.REPORT_TAB || ':' || e.ELEMENT_NAME, d.DOC_KEY, e.ELEMENT_NAME, 'REPORT_ELEMENT',
+       e.ELEMENT_TYPE, PARSE_JSON(e.DIMENSIONS), PARSE_JSON(e.MEASURES), PARSE_JSON(e.FILTERS),
+       (SELECT BOOLOR_AGG(q.HAS_PROMPT) FROM INVENTORY.BO_WEBI_QUERIES q WHERE q.DOC_SI_ID = d.SI_ID)
+FROM INVENTORY.BO_REPORT_ELEMENTS e
+JOIN INVENTORY.BO_WEBI_DOCUMENTS d ON d.SI_ID = e.DOC_SI_ID
+UNION ALL
+SELECT m.REPORT_ID || ':' || m.SECTION_NO, m.REPORT_ID, m.SECTION_NAME, 'SECTION',
+       m.VISUAL_TYPE, PARSE_JSON(m.DIMENSIONS), PARSE_JSON(m.MEASURES), PARSE_JSON(m.FILTERS), m.HAS_PROMPT
+FROM INVENTORY.MEDE_REPORT_SECTIONS m;
+
+-- ---------------------------------------------------- ASSET_DATA_SOURCE -----
+-- Each physical table an asset reads, joined to the catalog so we know what it
+-- is and whether it still exists.
+CREATE OR REPLACE TABLE ASSET_DATA_SOURCE AS
+WITH src AS (
+    SELECT ds.WORKBOOK_ID AS ASSET_ID, ds.DATASOURCE_ID AS SOURCE_ID, ds.NAME AS SOURCE_NAME,
+           ds.CONNECTION_TYPE, ds.DATABASE_NAME AS SOURCE_DATABASE, ds.SCHEMA_NAME AS SOURCE_SCHEMA,
+           t.VALUE::TEXT AS SOURCE_TABLE, ds.HAS_CUSTOM_SQL, ds.HAS_EXTRACT, ds.IS_CERTIFIED, ds.IS_PUBLISHED,
+           ds.EXTRACT_REFRESH_SCHEDULE AS REFRESH_SCHEDULE
+    FROM INVENTORY.TABLEAU_DATASOURCES ds, LATERAL FLATTEN(INPUT => PARSE_JSON(ds.TABLE_NAMES)) t
+    UNION ALL
+    SELECT r.REPORT_ID, dt.DATASET_ID || ':' || dt.TABLE_NAME, d.NAME,
+           LOWER(dt.SOURCE_TYPE), dt.SOURCE_DATABASE, dt.SOURCE_SCHEMA, dt.SOURCE_TABLE,
+           dt.SOURCE_EXPRESSION ILIKE 'Value.NativeQuery%', d.STORAGE_MODE = 'Import', d.ENDORSEMENT = 'Certified', TRUE,
+           d.REFRESH_SCHEDULE
+    FROM INVENTORY.PBI_DATASET_TABLES dt
+    JOIN INVENTORY.PBI_DATASETS d ON d.DATASET_ID = dt.DATASET_ID
+    JOIN INVENTORY.PBI_REPORTS r ON r.DATASET_ID = dt.DATASET_ID
+    UNION ALL
+    -- BO: a document reads a universe; the universe's objects name the tables
+    SELECT DISTINCT b.DOC_KEY, 'UNV:' || b.UNIVERSE_SI_ID, b.UNIVERSE_NAME, LOWER(b.DB_TYPE), b.DATABASE_NAME,
+           SPLIT_PART(REGEXP_REPLACE(o.SELECT_SQL, '^sum\\(|\\)$', ''), '.', 1),
+           SPLIT_PART(REGEXP_REPLACE(o.SELECT_SQL, '^sum\\(|\\)$', ''), '.', 2),
+           b.HAS_CUSTOM_SQL, FALSE, FALSE, TRUE, NULL
+    FROM (
+        SELECT d.DOC_KEY, u.SI_ID AS UNIVERSE_SI_ID, u.SI_NAME AS UNIVERSE_NAME, u.DB_TYPE, u.DATABASE_NAME,
+               q.HAS_CUSTOM_SQL, ro.VALUE::TEXT AS OBJECT_NAME
+        FROM INVENTORY.BO_WEBI_DOCUMENTS d
+        JOIN INVENTORY.BO_WEBI_QUERIES q ON q.DOC_SI_ID = d.SI_ID
+        JOIN INVENTORY.BO_UNIVERSES u ON u.SI_ID = q.UNIVERSE_SI_ID,
+        LATERAL FLATTEN(INPUT => PARSE_JSON(q.RESULT_OBJECTS)) ro
+    ) b
+    JOIN INVENTORY.BO_UNIVERSE_OBJECTS o ON o.UNIVERSE_SI_ID = b.UNIVERSE_SI_ID AND LOWER(o.OBJECT_NAME) = LOWER(b.OBJECT_NAME)
+    UNION ALL
+    -- MedeAnalytics: a report reads vendor data DOMAINS (schema.table in the export);
+    -- the hosting database is the platform itself.
+    SELECT r.REPORT_ID, 'MEDE:' || d.VALUE::TEXT, d.VALUE::TEXT, 'hosted', 'MEDE_PLATFORM',
+           SPLIT_PART(d.VALUE::TEXT, '.', 1), SPLIT_PART(d.VALUE::TEXT, '.', 2),
+           FALSE, FALSE, r.REPORT_TYPE = 'Standard', TRUE, IFF(r.IS_SCHEDULED, 'Vendor schedule', NULL)
+    FROM INVENTORY.MEDE_REPORTS r, LATERAL FLATTEN(INPUT => PARSE_JSON(r.DATA_DOMAINS)) d
+)
+SELECT s.ASSET_ID, s.SOURCE_ID, s.SOURCE_NAME, s.CONNECTION_TYPE,
+       s.SOURCE_DATABASE,
+       COALESCE(c.SOURCE_SCHEMA, s.SOURCE_SCHEMA) AS SOURCE_SCHEMA,
+       s.SOURCE_TABLE, s.HAS_CUSTOM_SQL, s.HAS_EXTRACT, s.IS_CERTIFIED, s.IS_PUBLISHED, s.REFRESH_SCHEDULE,
+       c.SUBJECT_AREA, c.CONFORMED_ENTITY, c.ENTITY_ROLE, c.SYSTEM_FAMILY,
+       COALESCE(c.IS_DECOMMISSIONED, FALSE) AS IS_DECOMMISSIONED,
+       c.SOURCE_DATABASE = 'SHAREPOINT'     AS IS_UNMANAGED_SOURCE,
+       c.SOURCE_TABLE IS NULL               AS IS_UNCATALOGED
+FROM src s
+LEFT JOIN INVENTORY.SOURCE_SYSTEM_CATALOG c
+       ON c.SOURCE_DATABASE = s.SOURCE_DATABASE AND UPPER(c.SOURCE_TABLE) = UPPER(s.SOURCE_TABLE);
+
+-- ----------------------------------------------------------- ASSET_FIELD ----
+-- Base fields (with lineage) and calculated fields (with an expression in the
+-- tool's language). The COMPLEXITY_TAG is classified from the expression text
+-- and is what the conversion step keys on.
+CREATE OR REPLACE FUNCTION CONFORMED.CLASSIFY_EXPRESSION(LANG TEXT, EXPR TEXT)
+RETURNS TEXT
+AS $$
+    CASE
+      WHEN EXPR IS NULL THEN NULL
+      WHEN EXPR LIKE '[Mede standard measure]%' OR LANG = 'MEDE' AND EXPR ILIKE '%vendor-defined%' THEN 'VENDOR_DEFINED'
+      WHEN EXPR ILIKE '%SCRIPT_REAL(%' OR EXPR ILIKE '%SCRIPT_STR(%' OR EXPR ILIKE '%SCRIPT_INT(%' THEN 'EXTERNAL_SCRIPT'
+      WHEN EXPR ILIKE '%USERPRINCIPALNAME()%' OR EXPR ILIKE '%USERNAME()%' OR EXPR ILIKE '%CurrentUser()%' THEN 'RLS'
+      WHEN EXPR LIKE '%{FIXED%' OR EXPR LIKE '%{INCLUDE%' OR EXPR LIKE '%{EXCLUDE%' THEN 'LOD'
+      WHEN REGEXP_LIKE(EXPR, '.*(SAMEPERIODLASTYEAR|TOTALYTD|TOTALMTD|TOTALQTD|DATESINPERIOD|DATESYTD|PREVIOUSMONTH|PREVIOUSYEAR|DATEADD\\(.*DATE.*\\)|PARALLELPERIOD).*', 'i')
+           AND LANG = 'DAX' THEN 'TIME_INTEL'
+      WHEN REGEXP_LIKE(EXPR, '.*(WINDOW_[A-Z]+\\(|LOOKUP\\(|RUNNING_[A-Z]+\\(|TOTAL\\(|RANK\\(|RANK_[A-Z]+\\(|FIRST\\(\\)|LAST\\(\\)|INDEX\\(\\)|SIZE\\(\\)|PREVIOUS_VALUE\\(|RunningSum\\(|RunningAverage\\(|Previous\\(|Rank\\().*') THEN 'TABLE_CALC'
+      WHEN REGEXP_LIKE(EXPR, '.*(ForEach|ForAll| In Report| In Block| In \\(|NoFilter\\(|ALLSELECTED\\(|ALLEXCEPT\\(|ALL\\(|REMOVEFILTERS\\(|KEEPFILTERS\\().*') THEN 'CONTEXT'
+      WHEN REGEXP_LIKE(EXPR, '.*(SUMX\\(|AVERAGEX\\(|RANKX\\(|CONCATENATEX\\(|MAXX\\(|MINX\\(|COUNTX\\().*') THEN 'ITERATOR'
+      WHEN REGEXP_LIKE(EXPR, '.*(Parameter\\]|SELECTEDVALUE\\(|UserResponse\\(|@Prompt|Selector\\]).*') THEN 'PARAMETER'
+      WHEN REGEXP_LIKE(EXPR, '.*(REGEXP_|SPLIT\\(|CONTAINS\\(|FormatDate\\(|FORMAT\\(|SUBSTR|MID\\().*') THEN 'STRING'
+      WHEN EXPR ILIKE '%Merged%' THEN 'MERGED_DIM'
+      ELSE 'SIMPLE'
+    END
+$$;
+
+CREATE OR REPLACE TABLE ASSET_FIELD AS
+-- Tableau base fields, from lineage
+SELECT 'TAB-BF-' || MD5(l.DATASOURCE_ID || l.FIELD_NAME)     AS FIELD_ID,
+       ds.WORKBOOK_ID                                         AS ASSET_ID,
+       l.FIELD_NAME, 'BASE' AS FIELD_KIND, NULL AS EXPRESSION, 'TABLEAU_CALC' AS EXPRESSION_LANGUAGE,
+       NULL AS ROLE,
+       l.UPSTREAM_DATABASE AS SOURCE_DATABASE, l.UPSTREAM_SCHEMA AS SOURCE_SCHEMA,
+       l.UPSTREAM_TABLE AS SOURCE_TABLE, l.UPSTREAM_COLUMN AS SOURCE_COLUMN,
+       NULL AS COMPLEXITY_TAG
+FROM INVENTORY.TABLEAU_FIELD_LINEAGE l
+JOIN INVENTORY.TABLEAU_DATASOURCES ds ON ds.DATASOURCE_ID = l.DATASOURCE_ID
+UNION ALL
+SELECT cf.FIELD_ID, cf.WORKBOOK_ID, cf.NAME, 'CALCULATED', cf.FORMULA, 'TABLEAU_CALC',
+       UPPER(cf.ROLE), NULL, NULL, NULL, NULL, CONFORMED.CLASSIFY_EXPRESSION('TABLEAU', cf.FORMULA)
+FROM INVENTORY.TABLEAU_CALCULATED_FIELDS cf
+UNION ALL
+-- Power BI base columns, from the dataset table column map
+SELECT 'PBI-BF-' || MD5(r.REPORT_ID || dt.TABLE_NAME || c.VALUE:name::TEXT),
+       r.REPORT_ID, c.VALUE:name::TEXT, 'BASE', NULL, 'DAX', NULL,
+       dt.SOURCE_DATABASE, dt.SOURCE_SCHEMA, dt.SOURCE_TABLE, c.VALUE:sourceColumn::TEXT, NULL
+FROM INVENTORY.PBI_DATASET_TABLES dt
+JOIN INVENTORY.PBI_REPORTS r ON r.DATASET_ID = dt.DATASET_ID,
+LATERAL FLATTEN(INPUT => PARSE_JSON(dt.COLUMNS_JSON)) c
+UNION ALL
+SELECT 'PBI-CF-' || MD5(r.REPORT_ID || m.TABLE_NAME || m.MEASURE_NAME), r.REPORT_ID, m.MEASURE_NAME, 'CALCULATED',
+       m.EXPRESSION, 'DAX', IFF(m.KIND = 'measure', 'MEASURE', 'DIMENSION'), NULL, NULL, NULL, NULL,
+       CONFORMED.CLASSIFY_EXPRESSION('DAX', m.EXPRESSION)
+FROM INVENTORY.PBI_MEASURES m
+JOIN INVENTORY.PBI_REPORTS r ON r.DATASET_ID = m.DATASET_ID
+UNION ALL
+-- BO result objects resolve to universe objects, which carry the SELECT
+SELECT 'BO-BF-' || MD5(b.DOC_KEY || b.OBJECT_NAME), b.DOC_KEY, b.OBJECT_NAME, 'BASE', NULL, 'BO_FORMULA',
+       UPPER(o.OBJECT_TYPE),
+       b.DATABASE_NAME,
+       SPLIT_PART(REGEXP_REPLACE(o.SELECT_SQL, '^sum\\(|\\)$', ''), '.', 1),
+       SPLIT_PART(REGEXP_REPLACE(o.SELECT_SQL, '^sum\\(|\\)$', ''), '.', 2),
+       SPLIT_PART(REGEXP_REPLACE(o.SELECT_SQL, '^sum\\(|\\)$', ''), '.', 3),
+       NULL
+FROM (
+    SELECT d.DOC_KEY, u.SI_ID AS UNIVERSE_SI_ID, u.DATABASE_NAME, ro.VALUE::TEXT AS OBJECT_NAME
+    FROM INVENTORY.BO_WEBI_DOCUMENTS d
+    JOIN INVENTORY.BO_WEBI_QUERIES q ON q.DOC_SI_ID = d.SI_ID
+    JOIN INVENTORY.BO_UNIVERSES u ON u.SI_ID = q.UNIVERSE_SI_ID,
+    LATERAL FLATTEN(INPUT => PARSE_JSON(q.RESULT_OBJECTS)) ro
+) b
+JOIN INVENTORY.BO_UNIVERSE_OBJECTS o ON o.UNIVERSE_SI_ID = b.UNIVERSE_SI_ID AND LOWER(o.OBJECT_NAME) = LOWER(b.OBJECT_NAME)
+UNION ALL
+SELECT 'BO-CF-' || MD5(d.DOC_KEY || v.VARIABLE_NAME), d.DOC_KEY, v.VARIABLE_NAME, 'CALCULATED', v.FORMULA, 'BO_FORMULA',
+       UPPER(v.QUALIFICATION), NULL, NULL, NULL, NULL, CONFORMED.CLASSIFY_EXPRESSION('BO', v.FORMULA)
+FROM INVENTORY.BO_WEBI_VARIABLES v
+JOIN INVENTORY.BO_WEBI_DOCUMENTS d ON d.SI_ID = v.DOC_SI_ID
+UNION ALL
+-- MedeAnalytics base fields: lineage stops at the vendor domain column
+SELECT 'MEDE-BF-' || MD5(f.REPORT_ID || f.FIELD_NAME), f.REPORT_ID, f.FIELD_NAME, 'BASE', NULL, 'MEDE',
+       UPPER(f.FIELD_KIND), 'MEDE_PLATFORM', SPLIT_PART(f.DATA_DOMAIN, '.', 1), SPLIT_PART(f.DATA_DOMAIN, '.', 2), f.DOMAIN_COLUMN, NULL
+FROM INVENTORY.MEDE_REPORT_FIELDS f WHERE f.DEFINITION IS NULL OR f.DEFINITION = ''
+UNION ALL
+-- MedeAnalytics calculated fields: vendor-defined measures carry the dictionary
+-- reference as their "expression"; custom report-builder fields carry the formula
+SELECT 'MEDE-CF-' || MD5(f.REPORT_ID || f.FIELD_NAME), f.REPORT_ID, f.FIELD_NAME, 'CALCULATED', f.DEFINITION, 'MEDE',
+       UPPER(f.FIELD_KIND), NULL, NULL, NULL, NULL, CONFORMED.CLASSIFY_EXPRESSION('MEDE', f.DEFINITION)
+FROM INVENTORY.MEDE_REPORT_FIELDS f WHERE f.DEFINITION IS NOT NULL AND f.DEFINITION <> '';
+
+-- A normalized field name, so "Net Patient Revenue (calc)", "Net Patient
+-- Revenue 2" and "Net Patient Revenue - adj" are recognized as one metric.
+ALTER TABLE ASSET_FIELD ADD COLUMN FIELD_NAME_KEY TEXT;
+UPDATE ASSET_FIELD
+   SET FIELD_NAME_KEY = TRIM(REGEXP_REPLACE(REGEXP_REPLACE(LOWER(FIELD_NAME),
+        '(\\(calc\\)| - adj|\\bv[0-9]+\\b|\\b[0-9]+$)', ''), '[^a-z0-9 ]', ' '));
+
+-- --------------------------------------------------------- ASSET_LINEAGE ----
+-- Asset -> source column -> conformed entity/attribute. The normalized column
+-- reverses each system's naming habit (CamelCase, hyphens, lower case) so the
+-- same attribute lands on the same name wherever it was read from.
+CREATE OR REPLACE TABLE ASSET_LINEAGE AS
+SELECT DISTINCT
+       f.ASSET_ID, f.SOURCE_DATABASE, f.SOURCE_SCHEMA, f.SOURCE_TABLE, f.SOURCE_COLUMN,
+       UPPER(REPLACE(REPLACE(REGEXP_REPLACE(f.SOURCE_COLUMN, '([a-z0-9])([A-Z])', '\\1_\\2'), '-', '_'), ' ', '_')) AS ATTRIBUTE_KEY,
+       c.SUBJECT_AREA, c.CONFORMED_ENTITY, c.ENTITY_ROLE,
+       COALESCE(c.IS_DECOMMISSIONED, FALSE) AS IS_DECOMMISSIONED
+FROM ASSET_FIELD f
+LEFT JOIN INVENTORY.SOURCE_SYSTEM_CATALOG c
+       ON c.SOURCE_DATABASE = f.SOURCE_DATABASE AND UPPER(c.SOURCE_TABLE) = UPPER(f.SOURCE_TABLE)
+WHERE f.FIELD_KIND = 'BASE' AND f.SOURCE_TABLE IS NOT NULL;
+
+-- ----------------------------------------------------------- USAGE_DAILY ----
+-- One row per asset per user per day, whatever the platform logged.
+CREATE OR REPLACE TABLE USAGE_DAILY AS
+SELECT WORKBOOK_ID AS ASSET_ID, STAT_DATE AS USAGE_DATE, LOWER(USER_EMAIL) AS USER_EMAIL,
+       SUM(NB_VIEWS) AS VIEW_COUNT, 0 AS EXPORT_COUNT, 'INTERACTIVE' AS USAGE_CHANNEL
+FROM INVENTORY.TABLEAU_VIEWS_STATS GROUP BY 1, 2, 3
+UNION ALL
+SELECT REPORT_ID, ACTIVITY_DATETIME::DATE, LOWER(USER_ID),
+       SUM(IFF(ACTIVITY = 'ViewReport', 1, 0)), SUM(IFF(ACTIVITY IN ('ExportReport', 'ExportArtifact', 'PrintReport'), 1, 0)),
+       IFF(MAX(DISTRIBUTION_METHOD) = 'Embedded', 'EMBEDDED', 'INTERACTIVE')
+FROM INVENTORY.PBI_ACTIVITY_EVENTS GROUP BY 1, 2, 3
+UNION ALL
+SELECT d.DOC_KEY, e.START_TIME::DATE, LOWER(e.USER_NAME),
+       SUM(IFF(e.EVENT_TYPE IN ('View', 'Refresh', 'Prompt'), 1, 0)), SUM(IFF(e.EVENT_TYPE = 'Export', 1, 0)), 'INTERACTIVE'
+FROM INVENTORY.BO_AUDIT_EVENTS e
+JOIN INVENTORY.BO_WEBI_DOCUMENTS d ON d.SI_ID = e.OBJECT_SI_ID
+GROUP BY 1, 2, 3
+UNION ALL
+SELECT REPORT_ID, ACTIVITY_TIME::DATE, LOWER(USER_EMAIL),
+       SUM(IFF(ACTION IN ('View', 'Drill'), 1, 0)), SUM(IFF(ACTION IN ('Export', 'Print'), 1, 0)), 'INTERACTIVE'
+FROM INVENTORY.MEDE_USER_ACTIVITY GROUP BY 1, 2, 3;
+
+-- -------------------------------------------------------- ASSET_DELIVERY ----
+-- Subscriptions and schedules. A report delivered by email every Monday can
+-- show zero interactive views and still be the CFO's most-read document.
+CREATE OR REPLACE TABLE ASSET_DELIVERY AS
+WITH subs AS (
+    SELECT WORKBOOK_ID AS ASSET_ID, LOWER(USER_EMAIL) AS USER_EMAIL FROM INVENTORY.TABLEAU_SUBSCRIPTIONS WHERE IS_ENABLED
+    UNION ALL SELECT REPORT_ID, LOWER(USER_EMAIL) FROM INVENTORY.PBI_SUBSCRIPTIONS WHERE IS_ENABLED
+    UNION ALL SELECT REPORT_ID, LOWER(RECIPIENT_EMAIL) FROM INVENTORY.MEDE_DELIVERIES WHERE IS_ACTIVE
+), bo_sched AS (
+    SELECT d.DOC_KEY AS ASSET_ID, s.RECIPIENT_COUNT, s.DESTINATION, s.RECURRENCE, s.LAST_RUN_STATUS
+    FROM INVENTORY.BO_SCHEDULES s JOIN INVENTORY.BO_WEBI_DOCUMENTS d ON d.SI_ID = s.DOC_SI_ID
+), sub_agg AS (
+    SELECT s.ASSET_ID, COUNT(*) AS SUBSCRIPTION_COUNT,
+           COUNT_IF(u.IS_EXECUTIVE) AS EXEC_SUBSCRIBER_COUNT,
+           COUNT_IF(NOT COALESCE(u.IS_ACTIVE, FALSE)) AS INACTIVE_SUBSCRIBER_COUNT
+    FROM subs s LEFT JOIN CONFORMED.V_USER u ON LOWER(u.EMAIL) = s.USER_EMAIL
+    GROUP BY 1
+), refresh AS (
+    SELECT WORKBOOK_ID AS ASSET_ID, COUNT(*) AS REFRESH_RUNS_90, COUNT_IF(STATUS = 'Failed') AS REFRESH_FAILURES_90
+    FROM INVENTORY.TABLEAU_EXTRACT_REFRESHES WHERE STARTED_AT >= DATEADD(day, -90, INVENTORY.AS_OF_DATE()) GROUP BY 1
+    UNION ALL
+    SELECT r.REPORT_ID, COUNT(*), COUNT_IF(h.STATUS = 'Failed')
+    FROM INVENTORY.PBI_REFRESH_HISTORY h JOIN INVENTORY.PBI_REPORTS r ON r.DATASET_ID = h.DATASET_ID
+    WHERE h.START_TIME >= DATEADD(day, -90, INVENTORY.AS_OF_DATE()) GROUP BY 1
+)
+SELECT a.ASSET_ID,
+       COALESCE(sa.SUBSCRIPTION_COUNT, 0) + COALESCE(bs.RECIPIENT_COUNT, 0) AS SUBSCRIPTION_COUNT,
+       COALESCE(sa.EXEC_SUBSCRIBER_COUNT, 0)                                 AS EXEC_SUBSCRIBER_COUNT,
+       COALESCE(sa.INACTIVE_SUBSCRIBER_COUNT, 0)                             AS INACTIVE_SUBSCRIBER_COUNT,
+       COALESCE(bs.DESTINATION, IFF(sa.SUBSCRIPTION_COUNT > 0, 'Email', NULL)) AS DELIVERY_DESTINATION,
+       COALESCE(bs.RECURRENCE, NULL)                                         AS DELIVERY_RECURRENCE,
+       COALESCE(r.REFRESH_RUNS_90, 0)                                        AS REFRESH_RUNS_90,
+       COALESCE(r.REFRESH_FAILURES_90, 0)                                    AS REFRESH_FAILURES_90,
+       IFF(COALESCE(r.REFRESH_RUNS_90, 0) = 0, NULL, r.REFRESH_FAILURES_90 / r.REFRESH_RUNS_90) AS REFRESH_FAILURE_RATE,
+       bs.LAST_RUN_STATUS                                                    AS LAST_SCHEDULE_STATUS,
+       EXISTS (SELECT 1 FROM ASSET_DATA_SOURCE s WHERE s.ASSET_ID = a.ASSET_ID AND s.REFRESH_SCHEDULE IS NOT NULL)
+         OR bs.ASSET_ID IS NOT NULL                                          AS IS_SCHEDULED
+FROM ASSET a
+LEFT JOIN sub_agg sa ON sa.ASSET_ID = a.ASSET_ID
+LEFT JOIN (SELECT ASSET_ID, SUM(RECIPIENT_COUNT) RECIPIENT_COUNT, MAX(DESTINATION) DESTINATION,
+                  MAX(RECURRENCE) RECURRENCE, MAX(LAST_RUN_STATUS) LAST_RUN_STATUS FROM bo_sched GROUP BY 1) bs ON bs.ASSET_ID = a.ASSET_ID
+LEFT JOIN refresh r ON r.ASSET_ID = a.ASSET_ID;
+
+-- --------------------------------------------------------- USAGE_SUMMARY ----
+CREATE OR REPLACE TABLE USAGE_SUMMARY AS
+WITH d AS (
+    SELECT u.*, ud.IS_EXECUTIVE, ud.IS_BI_DEVELOPER, ud.DEPARTMENT AS USER_DEPARTMENT, ud.IS_ACTIVE AS USER_IS_ACTIVE,
+           DATEDIFF(day, u.USAGE_DATE, INVENTORY.AS_OF_DATE()) AS AGE_DAYS
+    FROM USAGE_DAILY u LEFT JOIN CONFORMED.V_USER ud ON LOWER(ud.EMAIL) = u.USER_EMAIL
+)
+SELECT a.ASSET_ID,
+       COALESCE(SUM(IFF(d.AGE_DAYS < 30,  d.VIEW_COUNT, 0)), 0)        AS VIEWS_30,
+       COALESCE(SUM(IFF(d.AGE_DAYS < 90,  d.VIEW_COUNT, 0)), 0)        AS VIEWS_90,
+       COALESCE(SUM(IFF(d.AGE_DAYS < 365, d.VIEW_COUNT, 0)), 0)        AS VIEWS_365,
+       COALESCE(SUM(IFF(d.AGE_DAYS >= 90 AND d.AGE_DAYS < 180, d.VIEW_COUNT, 0)), 0) AS VIEWS_PRIOR_90,
+       COALESCE(SUM(d.VIEW_COUNT), 0)                                   AS VIEWS_TOTAL,
+       COALESCE(SUM(IFF(d.AGE_DAYS < 90, d.EXPORT_COUNT, 0)), 0)       AS EXPORTS_90,
+       COUNT(DISTINCT IFF(d.AGE_DAYS < 90,  d.USER_EMAIL, NULL))        AS VIEWERS_90,
+       COUNT(DISTINCT IFF(d.AGE_DAYS < 365, d.USER_EMAIL, NULL))        AS VIEWERS_365,
+       COUNT(DISTINCT IFF(d.AGE_DAYS < 365 AND d.IS_EXECUTIVE, d.USER_EMAIL, NULL)) AS EXEC_VIEWERS_365,
+       COUNT(DISTINCT IFF(d.AGE_DAYS < 365, d.USER_DEPARTMENT, NULL))   AS VIEWER_DEPARTMENTS_365,
+       COALESCE(SUM(IFF(d.AGE_DAYS < 365 AND d.IS_BI_DEVELOPER, d.VIEW_COUNT, 0)) / NULLIF(SUM(IFF(d.AGE_DAYS < 365, d.VIEW_COUNT, 0)), 0), 0) AS DEVELOPER_VIEW_SHARE,
+       COALESCE(SUM(IFF(d.AGE_DAYS < 365 AND d.USER_EMAIL = LOWER(a.OWNER_EMAIL), d.VIEW_COUNT, 0)) / NULLIF(SUM(IFF(d.AGE_DAYS < 365, d.VIEW_COUNT, 0)), 0), 0) AS OWNER_VIEW_SHARE,
+       MAX(d.USAGE_DATE)                                                AS LAST_VIEWED_DATE,
+       MIN(d.USAGE_DATE)                                                AS FIRST_VIEWED_DATE,
+       COALESCE(DATEDIFF(day, MAX(d.USAGE_DATE), INVENTORY.AS_OF_DATE()), 9999) AS DAYS_SINCE_LAST_VIEW,
+       IFF(SUM(IFF(d.AGE_DAYS >= 90 AND d.AGE_DAYS < 180, d.VIEW_COUNT, 0)) = 0, NULL,
+           SUM(IFF(d.AGE_DAYS < 90, d.VIEW_COUNT, 0)) / SUM(IFF(d.AGE_DAYS >= 90 AND d.AGE_DAYS < 180, d.VIEW_COUNT, 0))) AS TREND_RATIO_90,
+       BOOLOR_AGG(d.USAGE_CHANNEL = 'EMBEDDED')                         AS HAS_EMBEDDED_USAGE
+FROM ASSET a
+LEFT JOIN d ON d.ASSET_ID = a.ASSET_ID
+GROUP BY a.ASSET_ID, a.OWNER_EMAIL;
+
+-- ----------------------------------------------------- ASSET_COMPLEXITY -----
+CREATE OR REPLACE TABLE ASSET_COMPLEXITY AS
+SELECT a.ASSET_ID,
+       COUNT_IF(f.FIELD_KIND = 'BASE')                                          AS BASE_FIELD_COUNT,
+       COUNT_IF(f.FIELD_KIND = 'CALCULATED')                                    AS CALC_FIELD_COUNT,
+       COUNT_IF(f.COMPLEXITY_TAG = 'LOD')                                       AS LOD_COUNT,
+       COUNT_IF(f.COMPLEXITY_TAG = 'TIME_INTEL')                                AS TIME_INTEL_COUNT,
+       COUNT_IF(f.COMPLEXITY_TAG = 'TABLE_CALC')                                AS TABLE_CALC_COUNT,
+       COUNT_IF(f.COMPLEXITY_TAG = 'CONTEXT')                                   AS CONTEXT_COUNT,
+       COUNT_IF(f.COMPLEXITY_TAG = 'ITERATOR')                                  AS ITERATOR_COUNT,
+       COUNT_IF(f.COMPLEXITY_TAG = 'PARAMETER')                                 AS PARAMETER_COUNT,
+       COUNT_IF(f.COMPLEXITY_TAG IN ('RLS', 'EXTERNAL_SCRIPT', 'MERGED_DIM'))   AS SPECIAL_COUNT,
+       COUNT_IF(f.COMPLEXITY_TAG = 'VENDOR_DEFINED')                            AS VENDOR_DEFINED_COUNT,
+       (SELECT COUNT(DISTINCT SOURCE_DATABASE || '.' || SOURCE_TABLE) FROM ASSET_DATA_SOURCE s WHERE s.ASSET_ID = a.ASSET_ID) AS SOURCE_TABLE_COUNT,
+       (SELECT COUNT(DISTINCT SOURCE_DATABASE) FROM ASSET_DATA_SOURCE s WHERE s.ASSET_ID = a.ASSET_ID)                        AS SOURCE_SYSTEM_COUNT,
+       (SELECT BOOLOR_AGG(HAS_CUSTOM_SQL) FROM ASSET_DATA_SOURCE s WHERE s.ASSET_ID = a.ASSET_ID)                             AS HAS_CUSTOM_SQL,
+       (SELECT BOOLOR_AGG(IS_DECOMMISSIONED) FROM ASSET_DATA_SOURCE s WHERE s.ASSET_ID = a.ASSET_ID)                          AS HAS_DECOMMISSIONED_SOURCE,
+       (SELECT BOOLOR_AGG(IS_UNMANAGED_SOURCE) FROM ASSET_DATA_SOURCE s WHERE s.ASSET_ID = a.ASSET_ID)                        AS HAS_UNMANAGED_SOURCE,
+       (SELECT BOOLOR_AGG(IS_UNCATALOGED) FROM ASSET_DATA_SOURCE s WHERE s.ASSET_ID = a.ASSET_ID)                             AS HAS_UNCATALOGED_SOURCE,
+       a.COMPONENT_COUNT,
+       (SELECT BOOLOR_AGG(HAS_PARAMETER) FROM ASSET_COMPONENT c WHERE c.ASSET_ID = a.ASSET_ID)                                 AS HAS_PARAMETER
+FROM ASSET a
+LEFT JOIN ASSET_FIELD f ON f.ASSET_ID = a.ASSET_ID
+GROUP BY a.ASSET_ID, a.COMPONENT_COUNT;
